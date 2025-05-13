@@ -4045,6 +4045,7 @@ else:
             "Wav2Vec2ForXVector",
             "Wav2Vec2Model",
             "Wav2Vec2PreTrainedModel",
+            "Wav2Vec2ModelLang2VecCondition",
         ]
     )
     _import_structure["models.wav2vec2_bert"].extend(
@@ -8808,6 +8809,7 @@ if TYPE_CHECKING:
             Wav2Vec2ForXVector,
             Wav2Vec2Model,
             Wav2Vec2PreTrainedModel,
+            Wav2Vec2ModelLang2VecCondition,
         )
         from .models.wav2vec2_bert import (
             Wav2Vec2BertForAudioFrameClassification,

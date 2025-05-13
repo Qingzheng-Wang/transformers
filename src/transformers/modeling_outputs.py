@@ -14,7 +14,7 @@
 
 import warnings
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Optional, Tuple, List
 
 import torch
 
@@ -45,6 +45,16 @@ class BaseModelOutput(ModelOutput):
     last_hidden_state: Optional[torch.FloatTensor] = None
     hidden_states: Optional[Tuple[torch.FloatTensor, ...]] = None
     attentions: Optional[Tuple[torch.FloatTensor, ...]] = None
+
+@dataclass
+class BaseModelOutputWithLang2VecPreds(BaseModelOutput):
+    """
+    Base class for model's outputs with intermediate_lang2vec_preds.
+
+    Args:
+        intermediate_lang2vec_preds (`list(torch.FloatTensor)`, *optional*, used for compute the intermediat loss:
+    """
+    intermediate_lang2vec_preds: Optional[List[torch.FloatTensor]] = None
 
 
 @dataclass
@@ -1400,6 +1410,17 @@ class Wav2Vec2BaseModelOutput(ModelOutput):
     extract_features: Optional[torch.FloatTensor] = None
     hidden_states: Optional[Tuple[torch.FloatTensor, ...]] = None
     attentions: Optional[Tuple[torch.FloatTensor, ...]] = None
+
+@dataclass
+class Wav2Vec2BaseModelOutputWithLang2VecPreds(Wav2Vec2BaseModelOutput):
+    """
+    Base class for model's outputs, with intermediate_lang2vec_preds.
+
+    Args:
+        intermediate_lang2vec_preds (`List[torch.FloatTensor]` of shape `(batch_size, sequence_length, hidden_size)`):
+            Sequence of hidden-states at the output of the intermediate layers of the model.
+    """
+    intermediate_lang2vec_preds: Optional[List[torch.FloatTensor]] = None
 
 
 @dataclass
