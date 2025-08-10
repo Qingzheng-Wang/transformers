@@ -56,6 +56,18 @@ class BaseModelOutputWithLang2VecPreds(BaseModelOutput):
     """
     intermediate_lang2vec_preds: Optional[List[torch.FloatTensor]] = None
 
+@dataclass
+class BaseModelOutputWithLang2VecPredsLIDLogits(BaseModelOutput):
+    """
+    Base class for model's outputs with intermediate_lang2vec_preds.
+
+    Args:
+        intermediate_lang2vec_preds (`list(torch.FloatTensor)`, *optional*, used for compute the intermediat loss:
+        intermediate_lid_logits (`list(torch.FloatTensor)`, *optional*, used for compute the intermediat loss:
+    """
+    intermediate_lang2vec_preds: Optional[List[torch.FloatTensor]] = None
+    intermediate_lid_logits: Optional[List[torch.FloatTensor]] = None
+
 
 @dataclass
 class BaseModelOutputWithNoAttention(ModelOutput):
@@ -1421,6 +1433,18 @@ class Wav2Vec2BaseModelOutputWithLang2VecPreds(Wav2Vec2BaseModelOutput):
             Sequence of hidden-states at the output of the intermediate layers of the model.
     """
     intermediate_lang2vec_preds: Optional[List[torch.FloatTensor]] = None
+
+@dataclass
+class Wav2Vec2BaseModelOutputWithLang2VecPredsLIDLogits(Wav2Vec2BaseModelOutput):
+    """
+    Base class for model's outputs, with intermediate_lang2vec_preds.
+
+    Args:
+        intermediate_lang2vec_preds (`List[torch.FloatTensor]` of shape `(batch_size, sequence_length, hidden_size)`):
+            Sequence of hidden-states at the output of the intermediate layers of the model.
+    """
+    intermediate_lang2vec_preds: Optional[List[torch.FloatTensor]] = None
+    intermediate_lid_logits: Optional[List[torch.FloatTensor]] = None
 
 
 @dataclass
