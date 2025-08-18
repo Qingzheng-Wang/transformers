@@ -32,14 +32,12 @@ from ...modeling_flash_attention_utils import flash_attn_supports_top_left_mask,
 from ...modeling_outputs import (
     BaseModelOutput,
     BaseModelOutputWithLang2VecPreds,
-    BaseModelOutputWithLang2VecPredsLIDLogits,
     CausalLMOutput,
     MaskedLMOutput,
     SequenceClassifierOutput,
     TokenClassifierOutput,
     Wav2Vec2BaseModelOutput,
     Wav2Vec2BaseModelOutputWithLang2VecPreds,
-    Wav2Vec2BaseModelOutputWithLang2VecPredsLIDLogits,
     XVectorOutput,
 )
 from ...modeling_utils import PreTrainedModel
@@ -1172,258 +1170,51 @@ class Wav2Vec2EncoderStableLayerNorm(nn.Module):
             attentions=all_self_attentions,
         )
 
-
-class Wav2Vec2EncoderLang2VecCondition(Wav2Vec2EncoderStableLayerNorm):
-    def __init__(self, config):
-        super().__init__(config)
-
-        self.independent_module = False
-
-        # ====== ECAPA related ======
-        # NOTE(qingzheng): ECAPA encoder is defined in the downstream encoder (espnet_model)
-        # and will be transferred into this class in the espnet_model.
-        # If independent_module is set to True, the ecapa_encoder, pooling, and projector should be
-        # set separately for each intermediate layer.
-        # Else, in the espnet_model, these will be set to a single module same as the downstream, not
-        # in the ModuleDict.
-        self.ecapa_encoder: Union[nn.Module, nn.ModuleDict] = None
-        self.pooling: Union[nn.Module, nn.ModuleDict] = None
-        self.projector: Union[nn.Module, nn.ModuleDict] = None
-        self.lang2vec_head: Union[nn.Module, nn.ModuleDict] = None
-
-        # conditioning_layers should be a list of layer indices, 0 for the 
-        # input to the first layer, 1 for the output of the first layer, etc.
-        self.conditioning_layers: List[int] = None 
-
-        # project the lang2vec predictions to the model dim
-        # the conditioning_proj for each conditioning layer is independent.
-        self.conditioning_projs: nn.ModuleDict = nn.ModuleDict()
-
-        # determine whether to freeze the ECAPA modules in the upstream
-        self.frozen_ecapa: bool = None
-
-        self.cutoff_gradient_from_backbone: bool = None
-    
-    def _ecapa_lang2vec_pred(self, hidden_states, feat_lengths, layer_idx):
-        if self.independent_module:
-            ecapa_encoder = self.ecapa_encoder[str(layer_idx)]
-            pooling = self.pooling[str(layer_idx)]
-            lang2vec_head = self.lang2vec_head[str(layer_idx)]
-        else:
-            ecapa_encoder = self.ecapa_encoder
-            pooling = self.pooling
-            lang2vec_head = self.lang2vec_head
-
-        frame_level_feats = ecapa_encoder(hidden_states)
-        utt_level_feat = pooling(frame_level_feats, feat_lengths=feat_lengths)
-
-        if self.projector is not None:
-            if self.independent_module:
-                projector = self.projector[str(layer_idx)]
-            else:
-                projector = self.projector
-            lang_embd = projector(utt_level_feat)
-        else:
-            lang_embd = utt_level_feat
-
-        lang2vec_pred = lang2vec_head(lang_embd)
-        
-        return lang2vec_pred
-
-    def forward(
-        self,
-        hidden_states,
-        attention_mask=None,
-        output_attentions=False,
-        output_hidden_states=False,
-        return_dict=True,
-    ):
-        all_hidden_states = () if output_hidden_states else None
-        all_self_attentions = () if output_attentions else None
-
-        if attention_mask is not None:
-            # attention_mask: (batch_size, seq_len), [:length] = 1, [length:] = 0
-            # compute the feature lengths here according to the attention mask
-            feat_lengths = attention_mask.sum(dim=1).long() # (batch_size,)
-
-            # make sure padded tokens are not attended to
-            expand_attention_mask = attention_mask.unsqueeze(-1).repeat(1, 1, hidden_states.shape[2])
-            hidden_states = hidden_states * expand_attention_mask.to(dtype=hidden_states.dtype)
-            if self._use_flash_attention_2:
-                # 2d mask is passed through the layers
-                attention_mask = attention_mask if (attention_mask is not None and 0 in attention_mask) else None
-            else:
-                # extend attention_mask
-                attention_mask = 1.0 - attention_mask[:, None, None, :].to(dtype=hidden_states.dtype)
-                attention_mask = attention_mask * torch.finfo(hidden_states.dtype).min
-                attention_mask = attention_mask.expand(
-                    attention_mask.shape[0], 1, attention_mask.shape[-1], attention_mask.shape[-1]
-                )
-
-        position_embeddings = self.pos_conv_embed(hidden_states)
-        hidden_states = hidden_states + position_embeddings
-        hidden_states = self.dropout(hidden_states)
-
-        synced_gpus = is_deepspeed_zero3_enabled() or is_fsdp_managed_module(self)
-
-        # NOTE(qingzheng): we first consider do not update the language embedding
-        # extractor using the upstream intermediate features, use a well learned 
-        # (learn in downstream) language embedding extractor to extract the language 
-        # embedding.
-        intermediate_lang2vec_preds = None
-        if not self.frozen_ecapa:
-            intermediate_lang2vec_preds = []
-        for i, layer in enumerate(self.layers):
-            if output_hidden_states:
-                all_hidden_states = all_hidden_states + (hidden_states,)
-
-            # add LayerDrop (see https://arxiv.org/abs/1909.11556 for description)
-            # dropout_probability = torch.rand([])
-
-            # skip_the_layer = True if self.training and (dropout_probability < self.config.layerdrop) else False
-            # NOTE(qingzheng): during training, the layer will be skipped randomly according to the original setting of 
-            # the MMS-1B, but for lang2vec conditioning, we do not want to skip any layer, so set skip_the_layer to False. 
-            skip_the_layer = False
-            if not skip_the_layer or synced_gpus:
-                # under fsdp or deepspeed zero3 all gpus must run in sync
-                # XXX: could optimize this like synced_gpus in generate_utils but not sure if it's worth the code complication
-                if self.gradient_checkpointing and self.training:
-                    layer_outputs = self._gradient_checkpointing_func(
-                        layer.__call__,
-                        hidden_states,
-                        attention_mask,
-                        output_attentions,
-                    )
-                else:
-                    layer_outputs = layer(
-                        hidden_states, attention_mask=attention_mask, output_attentions=output_attentions
-                    )
-                hidden_states = layer_outputs[0]
-
-                if (
-                    self.conditioning_layers is not None and 
-                    len(self.conditioning_layers) > 0 and
-                    i in self.conditioning_layers
-                ):
-                    assert (
-                        self.ecapa_encoder and self.pooling and self.projector is not None, 
-                        "ECAPA encoder, pooling, and projector must be set in the espnet_model."
-                    )
-
-                    # ===== ECAPA language embedding extraction =====
-                    if self.frozen_ecapa:
-                        with torch.no_grad():
-                            lang2vec_pred = self._ecapa_lang2vec_pred(hidden_states, feat_lengths, i)
-                    else:
-                        lang2vec_pred = self._ecapa_lang2vec_pred(hidden_states, feat_lengths, i)
-                        intermediate_lang2vec_preds.append(lang2vec_pred)
-
-                    # NOTE(qingzheng): conditioning_proj is independent for each layer
-                    lang2vec_condition = self.conditioning_projs[str(i)](lang2vec_pred) # (batch_size, hidden_size)
-                    lang2vec_condition = lang2vec_condition.unsqueeze(1) # (batch_size, 1, hidden_size)
-
-                    # TODO: to explore more fusion options
-                    if self.cutoff_gradient_from_backbone:
-                        hidden_states = hidden_states + lang2vec_condition.detach()
-                    else:
-                        hidden_states = hidden_states + lang2vec_condition
-
-            if skip_the_layer:
-                layer_outputs = (None, None)
-
-            if output_attentions:
-                all_self_attentions = all_self_attentions + (layer_outputs[1],)
-
-        hidden_states = self.layer_norm(hidden_states)
-
-        if output_hidden_states:
-            all_hidden_states = all_hidden_states + (hidden_states,)
-
-        if not return_dict:
-            return tuple(v for v in [hidden_states, all_hidden_states, all_self_attentions] if v is not None)
-        return BaseModelOutputWithLang2VecPreds(
-            last_hidden_state=hidden_states,
-            hidden_states=all_hidden_states,
-            attentions=all_self_attentions,
-            intermediate_lang2vec_preds=intermediate_lang2vec_preds,
-        )
-
 class Wav2Vec2EncoderCondition(Wav2Vec2EncoderStableLayerNorm):
-    # NOTE(qingzheng): this is a combination of both self-conditioning LID and lang2vec conditioning. 
     def __init__(self, config):
         super().__init__(config)
 
-        self.independent_module = False
-
         # ====== ECAPA related ======
-        # NOTE(qingzheng): ECAPA encoder is defined in the downstream encoder 
-        # (espnet_model) and will be transferred into this class in the espnet_model.
-        # If independent_module is set to True, the ecapa_encoder, pooling, and 
-        # projector should be set separately for each intermediate layer. Else, 
-        # in the espnet_model, these will be set to a single module same as the 
-        # downstream, not in the ModuleDict. Bothe the lang2vec and lid conditioning 
-        # layers will use ecapa_encoder, pooling, and projector for language embedding 
-        # extraction. 
 
         # NOTE(qingzheng): here use the 'ecapa_encoder' to refer to the frame
         # level encoder of the embedding extractor, but it is not restricted to 
         # ECAPA, but can be any frame level encoder or passed with an 'identity_encoder'.
-        self.ecapa_encoder: Union[nn.Module, nn.ModuleDict] = None
-        self.pooling: Union[nn.Module, nn.ModuleDict] = None
-        self.projector: Union[nn.Module, nn.ModuleDict] = None
+        self.ecapa_encoder: nn.ModuleDict = None
+        self.pooling: nn.ModuleDict = None
+        self.projector: nn.ModuleDict = None
 
         # conditioning_layers should be a list of layer indices, 0 for the 
         # input to the first layer, 1 for the output of the first layer, etc.
-        self.lang2vec_conditioning_layers: List[int] = None 
-        self.lid_conditioning_layers: List[int] = None
-        self.conditioning_layers: List[int] = None 
+        self.lang2vec_conditioning_layers: List[int] = None
 
         self.apply_intermediate_lang2vec_condition = None
-        self.apply_intermediate_lid_class_condition = None
 
-        # lang2vec head and aamsoftmax head are independent for each layer
+        # lang2vec head is independent for each layer
         # and will be set in the espnet_model.
-        self.lang2vec_head: Union[nn.Module, nn.ModuleDict] = None
-        self.aamsoftmax_weight: Union[nn.Parameter, nn.ParameterDict] = None
+        self.lang2vec_head: nn.ModuleDict = None
 
         # project the lang2vec predictions or lid logits to the model dim
         # the conditioning_proj for each conditioning layer is independent.
-        self.lang2vec_conditioning_projs: nn.ModuleDict = None
-        self.lid_conditioning_projs: nn.ModuleDict = None
+        self.lang2vec_conditioning_projs: Union[nn.Module, nn.ModuleDict] = None
+
+        # NOTE(qingzheng): Keep the self.aamsoftmax_loss for compatibility 
+        # with early model checkpoints.
+        self.aamsoftmax_loss = None
 
         self.shared_conditioning_proj: bool = None
 
-        # the AAMSoftmax for each conditioning layer, for add compute cosine
-        # and add margin (if training).
-        self.aamsoftmax_loss: nn.Module = None
-
-        # determine whether to freeze the ECAPA modules in the upstream
-        self.frozen_ecapa: bool = None
-
         self.cutoff_gradient_from_backbone: bool = None
-        self.cutoff_gradient_before_condtrans: bool = None
+        self.cutoff_gradient_before_condproj: bool = None
 
-        # use gate to control the merge of lang2vec and hidden_states
-        self.use_gate: bool = None
-        self.gate_type: str = None
-        self.lang2vec_gate_projs: nn.ModuleDict = None
-    
     def _embedding_extract(self, hidden_states, feat_lengths, layer_idx):
-        if self.independent_module:
-            ecapa_encoder = self.ecapa_encoder[str(layer_idx)]
-            pooling = self.pooling[str(layer_idx)]
-        else:
-            ecapa_encoder = self.ecapa_encoder
-            pooling = self.pooling
+        ecapa_encoder = self.ecapa_encoder[str(layer_idx)]
+        pooling = self.pooling[str(layer_idx)]
 
         frame_level_feats = ecapa_encoder(hidden_states)
         utt_level_feat = pooling(frame_level_feats, feat_lengths=feat_lengths)
 
         if self.projector is not None:
-            if self.independent_module:
-                projector = self.projector[str(layer_idx)]
-            else:
-                projector = self.projector
+            projector = self.projector[str(layer_idx)]
             lang_embd = projector(utt_level_feat)
         else:
             lang_embd = utt_level_feat
@@ -1433,41 +1224,11 @@ class Wav2Vec2EncoderCondition(Wav2Vec2EncoderStableLayerNorm):
     def _ecapa_lang2vec_pred(self, hidden_states, feat_lengths, layer_idx):
         lang_embd = self._embedding_extract(hidden_states, feat_lengths, layer_idx)
 
-        if self.independent_module:
-            lang2vec_head = self.lang2vec_head[str(layer_idx)]
-        else:
-            lang2vec_head = self.lang2vec_head
+        lang2vec_head = self.lang2vec_head[str(layer_idx)]
 
         lang2vec_pred = lang2vec_head(lang_embd)
         
         return lang2vec_pred
-
-    def _lid_condition(self, hidden_states, feat_lengths, layer_idx, label=None):
-        # NOTE: IT IS HARMFUL, TO BE REMOVED
-        lang_embd = self._embedding_extract(hidden_states, feat_lengths, layer_idx)
-
-        aamsoftmax_weight = None
-        if self.independent_module:
-            aamsoftmax_weight = self.aamsoftmax_weight[str(layer_idx)]
-        else:
-            aamsoftmax_weight = self.aamsoftmax_weight
-
-        cosine = self.aamsoftmax_loss._calc_subcenter_cosine(lang_embd, aamsoftmax_weight)
-
-        if label is not None:
-            # NOTE(qingzheng): only use margin during training, 
-            # both evaluating and inference will not use.
-            # NOTE(qingzheng): use margined logits for for lid condtioning
-            # during training, to promote model learn discriminative features
-            margined_logits = self.aamsoftmax_loss._add_margin(cosine, label)
-            return margined_logits
-        else:
-            # NOTE(qingzheng): during inference, use the predicted label
-            pred_label = torch.argmax(cosine, dim=1)
-            margined_logits = self.aamsoftmax_loss._add_margin(cosine, pred_label)
-            return margined_logits
-
-        # return cosine
 
     def forward(
         self,
@@ -1506,15 +1267,7 @@ class Wav2Vec2EncoderCondition(Wav2Vec2EncoderStableLayerNorm):
 
         synced_gpus = is_deepspeed_zero3_enabled() or is_fsdp_managed_module(self)
 
-        # NOTE(qingzheng): we first consider do not update the language embedding
-        # extractor using the upstream intermediate features, use a well learned 
-        # (learn in downstream) language embedding extractor to extract the language 
-        # embedding.
-        intermediate_lang2vec_preds = None
-        intermediate_lid_logits = None
-        if not self.frozen_ecapa:
-            intermediate_lang2vec_preds = []
-            intermediate_lid_logits = []
+        intermediate_lang2vec_preds = []
         for i, layer in enumerate(self.layers):
             if output_hidden_states:
                 all_hidden_states = all_hidden_states + (hidden_states,)
@@ -1543,9 +1296,10 @@ class Wav2Vec2EncoderCondition(Wav2Vec2EncoderStableLayerNorm):
                 hidden_states = layer_outputs[0]
 
                 if (
-                    self.conditioning_layers is not None and 
-                    len(self.conditioning_layers) > 0 and
-                    i in self.conditioning_layers
+                    self.lang2vec_conditioning_layers is not None and 
+                    len(self.lang2vec_conditioning_layers) > 0 and
+                    i in self.lang2vec_conditioning_layers and
+                    self.apply_intermediate_lang2vec_condition
                 ):
                     assert (
                         self.ecapa_encoder and self.pooling and self.projector is not None, 
@@ -1553,100 +1307,32 @@ class Wav2Vec2EncoderCondition(Wav2Vec2EncoderStableLayerNorm):
                     )
 
                     # ===== ECAPA language embedding extraction =====
-                    if self.frozen_ecapa:
-                        with torch.no_grad():
-                            if (
-                                self.lang2vec_conditioning_layers is not None and 
-                                i in self.lang2vec_conditioning_layers
-                            ):
-                                lang2vec_pred = self._ecapa_lang2vec_pred(hidden_states, feat_lengths, i)
-                            
-                            if (
-                                self.lid_conditioning_layers is not None and 
-                                i in self.lid_conditioning_layers
-                            ):
-                                lid_logits = self._lid_condition(hidden_states, feat_lengths, i, label=labels)
-                            
-                    else:
-                        if (
-                            self.lang2vec_conditioning_layers is not None and
-                            i in self.lang2vec_conditioning_layers
-                        ):
-                            lang2vec_pred = self._ecapa_lang2vec_pred(hidden_states, feat_lengths, i)
-                            intermediate_lang2vec_preds.append(lang2vec_pred)
-                        
-                        if (
-                            self.lid_conditioning_layers is not None and
-                            i in self.lid_conditioning_layers
-                        ):
-                            lid_logits = self._lid_condition(hidden_states, feat_lengths, i, label=labels)
-                            intermediate_lid_logits.append(lid_logits)
+                    lang2vec_pred = self._ecapa_lang2vec_pred(hidden_states, feat_lengths, i)
+                    intermediate_lang2vec_preds.append(lang2vec_pred)
 
-                    # NOTE(qingzheng): conditioning_proj is independent for each layer
-                    if (
-                        self.lang2vec_conditioning_layers is not None and
-                        i in self.lang2vec_conditioning_layers and
-                        self.apply_intermediate_lang2vec_condition
-                    ):
-                        # NOTE: THIS DOES NOT WORK, AND IS HARMFUL, ACTUALLY, WE SHOULD KEEP 
-                        # THE RELATIVE VALUES OF GEO PRED SAME ACROSS DIFFERENT LAYERS
-                        if self.cutoff_gradient_before_condtrans:
-                            lang2vec_pred = lang2vec_pred.detach()
-                        
-                        if self.shared_conditioning_proj:
-                            condition = self.lang2vec_conditioning_projs(lang2vec_pred) # (batch_size, hidden_size)
-                        else:
-                            condition = self.lang2vec_conditioning_projs[str(i)](lang2vec_pred) # (batch_size, hidden_size)
-                        condition = condition.unsqueeze(1) # (batch_size, 1, hidden_size)
-
-                        if self.cutoff_gradient_from_backbone:
-                            condition = condition.detach()
-
-                        # NOT USED, GATE WILL CHANGE THE GEO VECTOR RELATIVE VALUES, MAKE THE GEO INFORMATION NOT CORRECT
-                        if self.use_gate:
-                            if self.gate_type == "hidden_only":
-                                gate = torch.sigmoid(self.lang2vec_gate_projs[str(i)](hidden_states))
-                            elif self.gate_type == "hidden_lang2vec_add":
-                                gate = torch.sigmoid(self.lang2vec_gate_projs[str(i)](hidden_states + condition))
-                            elif self.gate_type == "hidden_lang2vec_cat":
-                                gate = torch.sigmoid(
-                                    self.lang2vec_gate_projs[str(i)](
-                                        torch.cat([
-                                            hidden_states, condition.expand(-1, hidden_states.shape[1], -1)
-                                        ], dim=-1)
-                                    )
-                                )
-                            else:
-                                raise ValueError(f"Unknown gate type: {self.gate_type}")
-                            if not self.training:
-                                import logging
-                                logging.info(f"Gate at layer {i}")
-                                logging.info(f"Gate: {gate}")
-                                gate_mean_along_time = torch.mean(gate, dim=1).cpu().numpy()
-                                gate_time_8 = gate[0, 8, :].cpu().numpy()
-                                gate_time_8_mean = torch.mean(gate[0, 8, :]).cpu().numpy()
-                                logging.info(f"Gate mean along time: {gate_mean_along_time}")
-                                logging.info(f"Gate at time 8: {gate_time_8}") 
-                                logging.info(f"Gate mean at time 8: {gate_time_8_mean}")
-                            hidden_states = hidden_states + gate * condition
-                        else:
-                            hidden_states = hidden_states + condition
+                    if self.cutoff_gradient_before_condproj:
+                        lang2vec_pred = lang2vec_pred.detach()
                     
-                    # THE LID CONDITIONING IS REJECTED AND IS NOT USED
-                    if (
-                        self.lid_conditioning_layers is not None and
-                        i in self.lid_conditioning_layers and
-                        self.apply_intermediate_lid_class_condition
-                    ):
-                        import logging
-                        logging.info(f"++++++++++++++++++Warning: apply lid conditioning for layer {i}+++++++++++++++++++++")
-                        condition = self.lid_conditioning_projs[str(i)](lid_logits)
-                        condition = condition.unsqueeze(1) # (batch_size, 1, hidden_size)
+                    if self.shared_conditioning_proj:
+                        assert isinstance(self.lang2vec_conditioning_projs, nn.Module), (
+                            "The lang2vec_conditioning_projs should be a nn.Module, but got "
+                            f"{type(self.lang2vec_conditioning_projs)}"
+                        )
+                        condition = self.lang2vec_conditioning_projs(lang2vec_pred) # (batch_size, hidden_size)
+                    else:
+                        assert isinstance(self.lang2vec_conditioning_projs, nn.ModuleDict), (
+                            "The lang2vec_conditioning_projs should be a nn.ModuleDict, but got "
+                            f"{type(self.lang2vec_conditioning_projs)}"
+                        )
+                        condition = self.lang2vec_conditioning_projs[str(i)](lang2vec_pred) # (batch_size, hidden_size)
+                    condition = condition.unsqueeze(1) # (batch_size, 1, hidden_size)
 
-                        if self.cutoff_gradient_from_backbone:
-                            hidden_states = hidden_states + condition.detach()
-                        else:
-                            hidden_states = hidden_states + condition
+                    # if both cutoff_gradient_before_condproj and cutoff_gradient_from_backbone
+                    # are true, the lang2vec_conditioning_projs are frozen
+                    if self.cutoff_gradient_from_backbone:
+                        condition = condition.detach()
+
+                    hidden_states = hidden_states + condition
 
             if skip_the_layer:
                 layer_outputs = (None, None)
@@ -1661,14 +1347,13 @@ class Wav2Vec2EncoderCondition(Wav2Vec2EncoderStableLayerNorm):
 
         if not return_dict:
             return tuple(v for v in [hidden_states, all_hidden_states, all_self_attentions] if v is not None)
-        return BaseModelOutputWithLang2VecPredsLIDLogits(
+        return BaseModelOutputWithLang2VecPreds(
             last_hidden_state=hidden_states,
             hidden_states=all_hidden_states,
             attentions=all_self_attentions,
             intermediate_lang2vec_preds=intermediate_lang2vec_preds,
-            intermediate_lid_logits=intermediate_lid_logits,
         )
-        
+
 
 class Wav2Vec2GumbelVectorQuantizer(nn.Module):
     """
@@ -2341,11 +2026,11 @@ class Wav2Vec2Model(Wav2Vec2PreTrainedModel):
             hidden_states=encoder_outputs.hidden_states,
             attentions=encoder_outputs.attentions,
         )
-
-class Wav2Vec2ModelLang2VecCondition(Wav2Vec2Model):
+    
+class Wav2Vec2ModelCondition(Wav2Vec2Model):
     def __init__(self, config: Wav2Vec2Config):
         super().__init__(config)
-        self.encoder = Wav2Vec2EncoderLang2VecCondition(config)
+        self.encoder = Wav2Vec2EncoderCondition(config)
     
     @add_start_docstrings_to_model_forward(WAV2VEC2_INPUTS_DOCSTRING)
     @add_code_sample_docstrings(
@@ -2363,74 +2048,8 @@ class Wav2Vec2ModelLang2VecCondition(Wav2Vec2Model):
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
-    ) -> Union[Tuple, Wav2Vec2BaseModelOutputWithLang2VecPreds]:
-        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
-        output_hidden_states = (
-            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
-        )
-        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
-
-        extract_features = self.feature_extractor(input_values)
-        extract_features = extract_features.transpose(1, 2)
-
-        if attention_mask is not None:
-            # compute reduced attention_mask corresponding to feature vectors
-            attention_mask = self._get_feature_vector_attention_mask(
-                extract_features.shape[1], attention_mask, add_adapter=False
-            ) # (batch_size, feature_vector_length), e.g. [1, 1, 1, 1, 0, 0, 0] [:length] is 1
-
-        hidden_states, extract_features = self.feature_projection(extract_features)
-        hidden_states = self._mask_hidden_states(
-            hidden_states, mask_time_indices=mask_time_indices, attention_mask=attention_mask
-        )
-
-        encoder_outputs = self.encoder(
-            hidden_states,
-            attention_mask=attention_mask,
-            output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
-            return_dict=return_dict,
-        )
-
-        hidden_states = encoder_outputs[0]
-
-        if self.adapter is not None:
-            hidden_states = self.adapter(hidden_states)
-
-        if not return_dict:
-            return (hidden_states, extract_features) + encoder_outputs[1:]
-
-        return Wav2Vec2BaseModelOutputWithLang2VecPreds(
-            last_hidden_state=hidden_states,
-            extract_features=extract_features,
-            hidden_states=encoder_outputs.hidden_states,
-            attentions=encoder_outputs.attentions,
-            intermediate_lang2vec_preds=encoder_outputs.intermediate_lang2vec_preds,
-        )
-    
-class Wav2Vec2ModelCondition(Wav2Vec2Model):
-    def __init__(self, config: Wav2Vec2Config):
-        super().__init__(config)
-        self.encoder = Wav2Vec2EncoderCondition(config)
-    
-    @add_start_docstrings_to_model_forward(WAV2VEC2_INPUTS_DOCSTRING)
-    @add_code_sample_docstrings(
-        checkpoint=_CHECKPOINT_FOR_DOC,
-        output_type=Wav2Vec2BaseModelOutputWithLang2VecPredsLIDLogits,
-        config_class=_CONFIG_FOR_DOC,
-        modality="audio",
-        expected_output=_EXPECTED_OUTPUT_SHAPE,
-    )
-    def forward(
-        self,
-        input_values: Optional[torch.Tensor],
-        attention_mask: Optional[torch.Tensor] = None,
-        mask_time_indices: Optional[torch.FloatTensor] = None,
-        output_attentions: Optional[bool] = None,
-        output_hidden_states: Optional[bool] = None,
-        return_dict: Optional[bool] = None,
         labels: Optional[torch.Tensor] = None,
-    ) -> Union[Tuple, Wav2Vec2BaseModelOutputWithLang2VecPredsLIDLogits]:
+    ) -> Union[Tuple, Wav2Vec2BaseModelOutputWithLang2VecPreds]:
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
@@ -2468,13 +2087,12 @@ class Wav2Vec2ModelCondition(Wav2Vec2Model):
         if not return_dict:
             return (hidden_states, extract_features) + encoder_outputs[1:]
 
-        return Wav2Vec2BaseModelOutputWithLang2VecPredsLIDLogits(
+        return Wav2Vec2BaseModelOutputWithLang2VecPreds(
             last_hidden_state=hidden_states,
             extract_features=extract_features,
             hidden_states=encoder_outputs.hidden_states,
             attentions=encoder_outputs.attentions,
             intermediate_lang2vec_preds=encoder_outputs.intermediate_lang2vec_preds,
-            intermediate_lid_logits=encoder_outputs.intermediate_lid_logits,
         )
 
 
@@ -3361,6 +2979,5 @@ __all__ = [
     "Wav2Vec2ForXVector",
     "Wav2Vec2Model",
     "Wav2Vec2PreTrainedModel",
-    "Wav2Vec2ModelLang2VecCondition",
     "Wav2Vec2ModelCondition",
 ]

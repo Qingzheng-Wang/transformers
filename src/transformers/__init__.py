@@ -4045,7 +4045,6 @@ else:
             "Wav2Vec2ForXVector",
             "Wav2Vec2Model",
             "Wav2Vec2PreTrainedModel",
-            "Wav2Vec2ModelLang2VecCondition",
             "Wav2Vec2ModelCondition"
         ]
     )
@@ -8810,7 +8809,6 @@ if TYPE_CHECKING:
             Wav2Vec2ForXVector,
             Wav2Vec2Model,
             Wav2Vec2PreTrainedModel,
-            Wav2Vec2ModelLang2VecCondition,
             Wav2Vec2ModelCondition,
         )
         from .models.wav2vec2_bert import (
