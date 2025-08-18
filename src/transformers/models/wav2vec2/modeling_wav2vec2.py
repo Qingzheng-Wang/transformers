@@ -1401,7 +1401,7 @@ class Wav2Vec2EncoderCondition(Wav2Vec2EncoderStableLayerNorm):
         self.frozen_ecapa: bool = None
 
         self.cutoff_gradient_from_backbone: bool = None
-        self.cutoff_gradient_before_condproj: bool = None
+        self.cutoff_gradient_before_condtrans: bool = None
 
         # use gate to control the merge of lang2vec and hidden_states
         self.use_gate: bool = None
@@ -1590,7 +1590,7 @@ class Wav2Vec2EncoderCondition(Wav2Vec2EncoderStableLayerNorm):
                     ):
                         # NOTE: THIS DOES NOT WORK, AND IS HARMFUL, ACTUALLY, WE SHOULD KEEP 
                         # THE RELATIVE VALUES OF GEO PRED SAME ACROSS DIFFERENT LAYERS
-                        if self.cutoff_gradient_before_condproj:
+                        if self.cutoff_gradient_before_condtrans:
                             lang2vec_pred = lang2vec_pred.detach()
                         
                         if self.shared_conditioning_proj:
